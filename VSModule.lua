@@ -458,4 +458,4 @@ function VS.ClearPlaying() for _, f in ipairs(listdir(DIR_PLAYING)) do pcall(del
 function VS.ClearLast() for _, f in ipairs(listdir(DIR_LAST)) do pcall(delf, f) end end
 function VS.ClearAll() VS.ClearPlaying(); VS.ClearLast(); writef(HISTORY_FILE, "[]") end
 
-_G.VibeStream = VS
+return VS
