@@ -1,14 +1,14 @@
 --// =========================
---// VibeStream Module (cached)
+--// VibeStream Module (enhanced QoL)
 --// =========================
 
---// ---------- Constants
-local UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
-local COOKIE = "zvApp=detect2; zvLang=0; zvAuth=1"
+--========== Constants
+local UA            = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+local COOKIE        = "zvApp=detect2; zvLang=0; zvAuth=1"
 
 local ROOT          = "VibeStream"
-local DIR_LIBRARY   = ROOT.."/Library"       -- permanent store (no re-downloads)
-local DIR_PLAYING   = ROOT.."/Playing"       -- legacy (not used for storage now)
+local DIR_LIBRARY   = ROOT.."/Library"       -- permanent store (avoid re-downloads)
+local DIR_PLAYING   = ROOT.."/Playing"       -- legacy temp (not used for storage)
 local DIR_LAST      = ROOT.."/Last_Played"
 local HISTORY_FILE  = ROOT.."/history.json"
 local CACHE_SEARCH  = ROOT.."/search_cache.json"
@@ -18,23 +18,23 @@ local MAX_HISTORY   = 30
 local IMAGE_PLAY    = "rbxassetid://135451326413860"
 local IMAGE_PAUSE   = "rbxassetid://90193543893908"
 
---// ---------- Services
-local HttpService      = game:GetService("HttpService")
-local SoundService     = game:GetService("SoundService")
-local ContentProvider  = game:GetService("ContentProvider")
-local TweenService     = game:GetService("TweenService")
+--========== Services
+local HttpService     = game:GetService("HttpService")
+local SoundService    = game:GetService("SoundService")
+local ContentProvider = game:GetService("ContentProvider")
+local TweenService    = game:GetService("TweenService")
+local RunService      = game:GetService("RunService")
 
---// ---------- Module table (public API)
+--========== Module
 local VS = {}
 
---// ---------- File helpers
+--========== FS helpers
 local function EnsureDir(p) if not isfolder(p) then makefolder(p) end end
 local function ReadF(p) if isfile(p) then return readfile(p) end end
 local function WriteF(p, s) writefile(p, s) end
 local function DelF(p) if isfile(p) then delfile(p) end end
 local function ListDir(p) if isfolder(p) then return listfiles(p) else return {} end end
-local function MoveFile(src, dst) local b=ReadF(src); if b then WriteF(dst,b); DelF(src) end end
-local function CopyFile(src, dst) local b=ReadF(src); if b then WriteF(dst,b) end end
+local function CopyFile(src, dst) local b=ReadF(src); if b then writefile(dst,b) end end
 
 local function ReadJson(path, defaultTbl)
 	local ok, data = pcall(function()
@@ -50,7 +50,7 @@ local function WriteJson(path, tbl)
 	if ok and raw then WriteF(path, raw) end
 end
 
---// ---------- HTTP helpers
+--========== HTTP helpers
 local function Has(fname)
 	local ok, f = pcall(function() return getfenv()[fname] end)
 	return ok and typeof(f) == "function"
@@ -70,7 +70,7 @@ local function HttpGetUrl(url)
 	return nil
 end
 
---// ---------- Misc helpers
+--========== Misc helpers
 local function SanitizeFilename(s)
 	s = tostring(s or "audio")
 	s = s:gsub("[\\/:*?\"<>|]", "_")
@@ -118,39 +118,55 @@ local function FormatTime(secs)
 	return string.format("%d:%02d", m, s)
 end
 
---// ---------- Bootstrap storage
+local function SafeCall(fn, ...)
+	if not fn then return end
+	local ok, err = pcall(fn, ...)
+	if not ok then warn("[VS] callback error: "..tostring(err)) end
+end
+
+--========== Bootstrap storage
 EnsureDir(ROOT); EnsureDir(DIR_LIBRARY); EnsureDir(DIR_PLAYING); EnsureDir(DIR_LAST)
 if not isfile(HISTORY_FILE) then WriteF(HISTORY_FILE, "[]") end
 if not isfile(CACHE_SEARCH) then WriteF(CACHE_SEARCH, "{}") end
 if not isfile(LIB_INDEX) then WriteF(LIB_INDEX, "{}") end
 
---// ---------- State (private)
+--========== State
 local State = {
-	Sound         = nil,
-	Playing       = false,
-	Current       = nil, -- { id, title, url, file }
-	LastResults   = {},
-	OnEnded       = nil,
-	HistoryLimit  = MAX_HISTORY,
+	Sound        = nil,
+	Playing      = false,
+	Current      = nil,     -- { id, title, url, file }
+	LastResults  = {},
+	HistoryLimit = MAX_HISTORY,
+	Autoplay     = false,
 
 	UI = {
-		Container    = nil,
-		RowTemplate  = nil,
-		RowFactory   = nil,
-		Query        = nil,
-		NextPage     = nil,
-		Map          = {},           -- { PlayButton="A.B", TitleLabel="...", TimeLabel="..." }
-		ButtonById   = {},           -- id -> ImageButton
-		RowById      = {},           -- id -> row holder
+		Container     = nil,
+		RowTemplate   = nil,
+		RowFactory    = nil,
+		Query         = nil,
+		NextPage      = nil,
+		Map           = {},   -- { PlayButton="A.B", TitleLabel="...", TimeLabel="...", AddButton="..." }
+		ButtonById    = {},   -- id -> ImageButton
+		RowById       = {},   -- id -> holder
+		Placeholder   = nil,  -- frame shown when no query
+		BusyIndicator = nil,  -- show while searching
+		LiveDelay     = 0,    -- ms
+		_liveConn     = nil,
 	},
 
 	Cache = {
-		Searches     = ReadJson(CACHE_SEARCH, {}),
-		Library      = ReadJson(LIB_INDEX, {}), -- id -> {file, title, url}
-	}
+		Searches  = ReadJson(CACHE_SEARCH, {}),   -- key -> {results, nextPage}
+		Library   = ReadJson(LIB_INDEX, {}),      -- id -> {file, title, url}
+	},
+
+	Queue = {},
+
+	OnEnded    = nil,
+	OnError    = nil,
+	OnQueueUpd = nil,
 }
 
---// ---------- UI path helper
+--========== UI path helper
 local function GetFromPath(root, path)
 	if not root or not path or #path == 0 then return nil end
 	local cur = root
@@ -172,7 +188,20 @@ local function GetFromPath(root, path)
 	return cur
 end
 
---// ---------- Audio
+local function TogglePlaceholder(show)
+	local p = State.UI.Placeholder
+	local c = State.UI.Container
+	if p then p.Visible = (show == true) end
+	if c then c.Visible = (show ~= true) end
+end
+
+local function SetBusy(active)
+	local b = State.UI.BusyIndicator
+	if not b then return end
+	b.Visible = active and true or false
+end
+
+--========== Audio
 local function EnsureSound()
 	if State.Sound and State.Sound.Parent then return State.Sound end
 	local s = Instance.new("Sound")
@@ -183,20 +212,23 @@ local function EnsureSound()
 	s.Ended:Connect(function()
 		State.Playing = false
 		local c = State.Current
-
-		-- copy last to DIR_LAST without touching library
 		if c and c.file and isfile(c.file) then
 			local lastPath = ("%s/%s.mp3"):format(DIR_LAST, tostring(c.id or "last"))
-			CopyFile(c.file, lastPath)
+			CopyFile(c.file, lastPath) -- keep library intact
 		end
 
-		-- reset buttons
 		VS.RefreshPlayButtons()
+		VS.RefreshRowHighlight()
 
-		if State.OnEnded then
-			local id = c and c.id
-			task.spawn(State.OnEnded, id)
+		if #State.Queue > 0 then
+			VS.PlayNext() -- queue first
+			return
 		end
+		if State.Autoplay then
+			VS.PlayNext() -- from last results
+		end
+
+		SafeCall(State.OnEnded, c and c.id)
 	end)
 	State.Sound = s
 	return s
@@ -242,27 +274,24 @@ local function PlayLocal(path, meta)
 	State.Playing = true
 	State.Current = { id = meta.id, title = meta.title, url = meta.url, file = path }
 
-	-- update button visuals
 	VS.RefreshPlayButtons()
+	VS.RefreshRowHighlight()
 end
 
---// ---------- History & library
+--========== History & library
 local function PushHistory(entry)
 	local hist = ReadJson(HISTORY_FILE, {})
 	hist[#hist+1] = entry
-
-	-- trim
 	if #hist > State.HistoryLimit then
-		local drop = #hist - State.HistoryLimit
-		local new = {}
-		for i = drop+1, #hist do new[#new+1] = hist[i] end
-		hist = new
+		local start = #hist - State.HistoryLimit + 1
+		local trimmed = {}
+		for i = start, #hist do trimmed[#trimmed+1] = hist[i] end
+		hist = trimmed
 	end
-
 	WriteJson(HISTORY_FILE, hist)
 end
 
---// ---------- Search
+--========== Search/resolve
 local function ParseResults(html)
 	local out = {}
 	for node in html:gmatch("<span[^>]-class=\"song%-play[^\"\n]*\"[^>]->") do
@@ -345,31 +374,30 @@ local function ResolveMp3UrlOrBody(id)
 	return nil, "Could not resolve direct MP3 URL (no redirect or audio body)."
 end
 
--- Search with cache
+-- search with persistent cache
 local function SearchImpl(query, page)
 	page = tonumber(page) or 1
-	local key = (string.lower(query or "") .. "::" .. tostring(page))
+	local q = tostring(query or "")
+	local key = (q:lower() .. "::" .. tostring(page))
 
-	-- serve from cache
+	-- cached
 	local cached = State.Cache.Searches[key]
 	if cached and type(cached) == "table" and cached.results then
 		State.LastResults = cached.results
 		return cached.results, cached.nextPage
 	end
 
-	-- fetch
-	local url = ("https://z3.fm/mp3/search?keywords=%s&page=%d&sort=views"):format(UrlEncode(query), page)
+	SetBusy(true)
+	local url = ("https://z3.fm/mp3/search?keywords=%s&page=%d&sort=views"):format(UrlEncode(q), page)
 	local r = Req({
 		Url = url, Method = "GET",
 		Headers = {
 			["User-Agent"] = UA, ["Cookie"] = COOKIE,
-			["X-Requested-With"] = "XMLHttpRequest",
-			["X-PJAX"] = "true", ["Accept"] = "*/*",
-			["Accept-Language"] = "en-US,en;q=0.9", ["Referer"] = "https://z3.fm/", ["DNT"] = "1",
+			["X-Requested-With"] = "XMLHttpRequest", ["X-PJAX"] = "true",
+			["Accept"] = "*/*", ["Accept-Language"] = "en-US,en;q=0.9", ["Referer"] = "https://z3.fm/", ["DNT"] = "1",
 		}
 	})
 	local body = (r and r.Body) or ""
-
 	if #body < 400 then
 		local r2 = Req({
 			Url = url, Method = "GET",
@@ -381,10 +409,9 @@ local function SearchImpl(query, page)
 		})
 		body = (r2 and r2.Body) or body
 	end
+	SetBusy(false)
 
 	local results, nextPage = ParseResults(body)
-
-	-- cache & persist
 	State.Cache.Searches[key] = { results = results, nextPage = nextPage }
 	WriteJson(CACHE_SEARCH, State.Cache.Searches)
 
@@ -392,7 +419,7 @@ local function SearchImpl(query, page)
 	return results, nextPage
 end
 
--- Download but prefer library
+-- download or reuse from library
 local function DownloadOrGetFromLibrary(id, title)
 	id = tonumber(id)
 	local lib = State.Cache.Library
@@ -401,7 +428,6 @@ local function DownloadOrGetFromLibrary(id, title)
 		return entry.file, entry.url or ""
 	end
 
-	-- resolve
 	local resolved, err = ResolveMp3UrlOrBody(id)
 	if not resolved then error(err or "MP3 resolve failed") end
 
@@ -436,7 +462,6 @@ local function DownloadOrGetFromLibrary(id, title)
 		error("Downloaded file is empty or missing: "..tostring(filePath))
 	end
 
-	-- save to library index (dedupe)
 	lib[tostring(id)] = { file = filePath, title = title or tostring(id), url = (resolved.url or resolved.finalUrl or "") }
 	WriteJson(LIB_INDEX, lib)
 
@@ -445,7 +470,7 @@ local function DownloadOrGetFromLibrary(id, title)
 	return filePath, (resolved.url or resolved.finalUrl or "")
 end
 
---// ---------- UI render
+--========== UI build
 local function ClearContainer(container)
 	for _, c in ipairs(container:GetChildren()) do
 		if c:IsA("GuiObject") and c.Name == "SongRow" then c:Destroy() end
@@ -491,6 +516,16 @@ local function SetButtonHover(btn)
 			TweenService:Create(btn, TweenInfo.new(0.12), { ImageTransparency = 0 }):Play()
 		end
 	end)
+	btn.MouseButton1Down:Connect(function()
+		if btn:IsA("ImageButton") then
+			TweenService:Create(btn, TweenInfo.new(0.06), { Size = btn.Size + UDim2.new(0,2,0,2) }):Play()
+		end
+	end)
+	btn.MouseButton1Up:Connect(function()
+		if btn:IsA("ImageButton") then
+			TweenService:Create(btn, TweenInfo.new(0.06), { Size = btn.Size - UDim2.new(0,2,0,2) }):Play()
+		end
+	end)
 end
 
 function VS.RefreshPlayButtons()
@@ -505,17 +540,29 @@ function VS.RefreshPlayButtons()
 	end
 end
 
+function VS.RefreshRowHighlight()
+	for id, row in pairs(State.UI.RowById) do
+		if row and row:IsA("GuiObject") then
+			local isActive = (State.Current and tonumber(id) == tonumber(State.Current.id))
+			local t = isActive and 0.06 or 0.1
+			if row.BackgroundTransparency ~= nil then
+				row.BackgroundTransparency = t
+			end
+			-- if there's a UIStroke, make it pop a bit
+			local stroke = row:FindFirstChildWhichIsA("UIStroke", true)
+			if stroke then stroke.Transparency = isActive and 0.3 or 0.6 end
+		end
+	end
+end
+
 local function RenderList(container, rows, replace)
 	if replace then ClearContainer(container) end
 
 	if not rows or #rows == 0 then
-		local holder = MakeRow(container)
-		local root = holder:FindFirstChild("Row") or holder
-		local t = State.UI.Map and GetFromPath(root, State.UI.Map.TitleLabel)
-		if t and t:IsA("TextLabel") then t.Text = "No results." end
-		if holder:IsA("TextButton") then holder.Text = "No results." end
+		TogglePlaceholder(true)
 		return
 	end
+	TogglePlaceholder(false)
 
 	for i, row in ipairs(rows) do
 		local holder = MakeRow(container)
@@ -531,104 +578,71 @@ local function RenderList(container, rows, replace)
 		end
 
 		-- play button
-		local target = State.UI.Map and GetFromPath(root, State.UI.Map.PlayButton)
-		if target and target:IsA("ImageButton") then
-			target.Image = IMAGE_PLAY
-			SetButtonHover(target)
-			State.UI.ButtonById[tostring(row.id)] = target
+		local pb = State.UI.Map and GetFromPath(root, State.UI.Map.PlayButton)
+		if pb and pb:IsA("ImageButton") then
+			pb.Image = IMAGE_PLAY
+			SetButtonHover(pb)
+			State.UI.ButtonById[tostring(row.id)] = pb
 			State.UI.RowById[tostring(row.id)] = holder
-
-			target.MouseButton1Click:Connect(function()
+			pb.MouseButton1Click:Connect(function()
 				if State.Current and tonumber(State.Current.id) == tonumber(row.id) then
-					-- toggle pause/resume on the same track
 					if State.Playing then VS.Pause() else VS.Resume() end
-					VS.RefreshPlayButtons()
 					return
 				end
-				-- play another track
 				task.spawn(function()
 					local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
-					if not ok then warn(err) end
+					if not ok then
+						warn(err)
+						SafeCall(State.OnError, err)
+					end
 				end)
 			end)
 		elseif holder:IsA("GuiButton") then
 			holder.MouseButton1Click:Connect(function()
 				task.spawn(function()
 					local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
-					if not ok then warn(err) end
+					if not ok then
+						warn(err)
+						SafeCall(State.OnError, err)
+					end
 				end)
+			end)
+		end
+
+		-- optional: add-to-queue button
+		local addb = State.UI.Map and GetFromPath(root, State.UI.Map.AddButton)
+		if addb and addb:IsA("GuiButton") then
+			addb.MouseButton1Click:Connect(function()
+				table.insert(State.Queue, { id=row.id, title=row.title, seconds=row.seconds })
+				SafeCall(State.OnQueueUpd, State.Queue)
 			end)
 		end
 	end
 
-	-- ensure icons reflect current state after rendering
 	VS.RefreshPlayButtons()
+	VS.RefreshRowHighlight()
 end
 
---// ---------- Public API
+--========== Public API
 
+-- mapping & UI
 function VS.SetRowMap(map) State.UI.Map = map or {} end
 function VS.SetRowFactory(fn) State.UI.RowFactory = fn end
 function VS.SetRowTemplate(template) State.UI.RowTemplate = template end
 function VS.SetResultsContainer(container) State.UI.Container = container end
-function VS.SetHistoryLimit(n) State.HistoryLimit = math.max(1, tonumber(n) or MAX_HISTORY) end
+function VS.BindPlaceholder(placeholderFrame) State.UI.Placeholder = placeholderFrame end
+function VS.BindBusyIndicator(instance) State.UI.BusyIndicator = instance end
+function VS.OnQueueChanged(fn) State.OnQueueUpd = fn end
+function VS.OnError(fn) State.OnError = fn end
 function VS.OnEnded(fn) State.OnEnded = fn end
 
+-- config
+function VS.SetHistoryLimit(n) State.HistoryLimit = math.max(1, tonumber(n) or MAX_HISTORY) end
+function VS.SetAutoplay(on) State.Autoplay = (on == true) end
+function VS.GetAutoplay() return State.Autoplay end
+
+-- search + render
 function VS.Search(q, page) return SearchImpl(q, page) end
-
-function VS.PlayById(id, title)
-	local filePath, url = DownloadOrGetFromLibrary(id, title)
-	PlayLocal(filePath, { id = id, title = title or tostring(id), url = url })
-end
-
-function VS.SearchAndPlay(query, index, page)
-	local rows = SearchImpl(query, page)
-	if not rows or #rows == 0 then return false, "no results" end
-	local n = math.clamp(tonumber(index) or 1, 1, #rows)
-	local row = rows[n]
-	VS.PlayById(row.id, row.title)
-	return true
-end
-
-function VS.Pause() local s=EnsureSound(); s:Pause(); State.Playing=false; VS.RefreshPlayButtons() end
-function VS.Resume() local s=EnsureSound(); s:Resume(); State.Playing=true; VS.RefreshPlayButtons() end
-function VS.TogglePause() if State.Playing then VS.Pause() else VS.Resume() end end
-function VS.Stop() local s=EnsureSound(); s:Stop(); State.Playing=false; VS.RefreshPlayButtons() end
-function VS.Seek(sec) local s=EnsureSound(); s.TimePosition = math.max(0, tonumber(sec) or 0) end
-function VS.SetSpeed(rate) local s=EnsureSound(); s.PlaybackSpeed = math.clamp(tonumber(rate) or 1, 0.05, 4) end
-function VS.SetVolume(v) local s=EnsureSound(); s.Volume = math.clamp(tonumber(v) or 0.5, 0, 1) end
-
-function VS.SwapToLastPlayed()
-	local hist = ReadJson(HISTORY_FILE, {})
-	if #hist == 0 then return false end
-	local last = hist[#hist-1] or hist[#hist]
-	if not last or not last.file or not isfile(last.file) then return false end
-	PlayLocal(last.file, { id = last.id, title = last.title, url = last.url })
-	return true
-end
-
-function VS.GetState()
-	local s = EnsureSound()
-	local c = State.Current or {}
-	local playbackState = "Unknown"
-	pcall(function() playbackState = s.PlaybackState and s.PlaybackState.Name or (s.IsPlaying and "Playing" or "Stopped") end)
-	return {
-		id=c.id, title=c.title, url=c.url, file=c.file,
-		isPlaying=State.Playing, time=s.TimePosition, length=s.TimeLength,
-		volume=s.Volume, speed=s.PlaybackSpeed, playbackState=playbackState,
-	}
-end
-
-function VS.GetLastResults() return State.LastResults end
-function VS.GetHistory() return ReadJson(HISTORY_FILE, {}) end
-
-function VS.ClearPlaying() for _, f in ipairs(ListDir(DIR_PLAYING)) do pcall(DelF, f) end end
-function VS.ClearLast() for _, f in ipairs(ListDir(DIR_LAST)) do pcall(DelF, f) end end
-function VS.ClearAll()
-	VS.ClearPlaying(); VS.ClearLast()
-	WriteF(HISTORY_FILE, "[]"); WriteF(CACHE_SEARCH, "{}"); WriteF(LIB_INDEX, "{}")
-	State.Cache.Searches = {}; State.Cache.Library = {}
-end
 
 function VS.RenderResultsTo(container, results)
 	State.UI.Container = container or State.UI.Container
@@ -646,19 +660,28 @@ function VS.ClearResults(container)
 	local c = container or State.UI.Container
 	if not c then return end
 	ClearContainer(c)
+	TogglePlaceholder(true)
 end
 
 function VS.SearchTo(container, q, page)
 	State.UI.Container = container or State.UI.Container
 	if not State.UI.Container then return end
-	if not q or q == "" then return end
+
+	local txt = tostring(q or ""):gsub("^%s+",""):gsub("%s+$","")
+	if txt == "" then
+		VS.ClearResults(State.UI.Container)
+		return
+	end
+
 	task.spawn(function()
-		local ok, res, np = pcall(function() return VS.Search(q, page) end)
+		local ok, res, np = pcall(function() return VS.Search(txt, page) end)
 		if not ok then
-			RenderList(State.UI.Container, {}, true)
+			warn(res)
+			SafeCall(State.OnError, res)
+			VS.ClearResults(State.UI.Container)
 			return
 		end
-		State.UI.Query = q
+		State.UI.Query = txt
 		State.UI.NextPage = np
 		RenderList(State.UI.Container, res, true)
 	end)
@@ -679,44 +702,146 @@ function VS.NextPage(container)
 	end)
 end
 
-function VS.PlayFirstOfLast()
-	local last = VS.GetLastResults()
-	if last and last[1] then
-		VS.PlayById(last[1].id, last[1].title)
-		return true
-	end
-	return false
+-- playback
+function VS.PlayById(id, title)
+	local filePath, url = DownloadOrGetFromLibrary(id, title)
+	PlayLocal(filePath, { id = id, title = title or tostring(id), url = url })
 end
 
-function VS.PlayAtIndex(i)
-	local rows = State.LastResults or {}
-	if not rows or #rows == 0 then return false end
-	local n = math.clamp(tonumber(i) or 1, 1, #rows)
+function VS.SearchAndPlay(query, index, page)
+	local rows = SearchImpl(query, page)
+	if not rows or #rows == 0 then return false, "no results" end
+	local n = math.clamp(tonumber(index) or 1, 1, #rows)
 	local row = rows[n]
 	VS.PlayById(row.id, row.title)
 	return true
 end
 
+function VS.Pause() local s=EnsureSound(); s:Pause(); State.Playing=false; VS.RefreshPlayButtons(); VS.RefreshRowHighlight() end
+function VS.Resume() local s=EnsureSound(); s:Resume(); State.Playing=true; VS.RefreshPlayButtons(); VS.RefreshRowHighlight() end
+function VS.TogglePause() if State.Playing then VS.Pause() else VS.Resume() end end
+function VS.Stop() local s=EnsureSound(); s:Stop(); State.Playing=false; VS.RefreshPlayButtons(); VS.RefreshRowHighlight() end
+function VS.Seek(sec) local s=EnsureSound(); s.TimePosition = math.max(0, tonumber(sec) or 0) end
+function VS.SeekSafe(sec) local s=EnsureSound(); local t = math.clamp(tonumber(sec) or 0, 0, s.TimeLength or 0); s.TimePosition = t end
+function VS.SetSpeed(rate) local s=EnsureSound(); s.PlaybackSpeed = math.clamp(tonumber(rate) or 1, 0.05, 4) end
+function VS.SetVolume(v) local s=EnsureSound(); s.Volume = math.clamp(tonumber(v) or 0.5, 0, 1) end
+
+function VS.SwapToLastPlayed()
+	local hist = ReadJson(HISTORY_FILE, {})
+	if #hist == 0 then return false end
+	local last = hist[#hist-1] or hist[#hist]
+	if not last or not last.file or not isfile(last.file) then return false end
+	PlayLocal(last.file, { id = last.id, title = last.title, url = last.url })
+	return true
+end
+
+function VS.PlayNext()
+	-- queue first
+	if #State.Queue > 0 then
+		local item = table.remove(State.Queue, 1)
+		SafeCall(State.OnQueueUpd, State.Queue)
+		if item then VS.PlayById(item.id, item.title) return true end
+	end
+	-- then from last results
+	local rows = State.LastResults or {}
+	if not rows or #rows == 0 or not State.Current then return false end
+	local idx = 1
+	for i, r in ipairs(rows) do if tonumber(r.id) == tonumber(State.Current.id) then idx = i + 1 break end end
+	if rows[idx] then VS.PlayById(rows[idx].id, rows[idx].title) return true end
+	return false
+end
+
+function VS.PlayPrev()
+	local rows = State.LastResults or {}
+	if not rows or #rows == 0 or not State.Current then return false end
+	local idx = 1
+	for i, r in ipairs(rows) do if tonumber(r.id) == tonumber(State.Current.id) then idx = i - 1 break end end
+	if idx >= 1 and rows[idx] then VS.PlayById(rows[idx].id, rows[idx].title) return true end
+	return false
+end
+
+-- state
+function VS.GetState()
+	local s = EnsureSound()
+	local c = State.Current or {}
+	local playbackState = "Unknown"
+	pcall(function() playbackState = s.PlaybackState and s.PlaybackState.Name or (s.IsPlaying and "Playing" or "Stopped") end)
+	return {
+		id=c.id, title=c.title, url=c.url, file=c.file,
+		isPlaying=State.Playing, time=s.TimePosition, length=s.TimeLength,
+		volume=s.Volume, speed=s.PlaybackSpeed, playbackState=playbackState,
+	}
+end
+
+function VS.GetLastResults() return State.LastResults end
+function VS.GetHistory() return ReadJson(HISTORY_FILE, {}) end
+function VS.GetQueue() return State.Queue end
+
+-- cleaners
+function VS.ClearPlaying() for _, f in ipairs(ListDir(DIR_PLAYING)) do pcall(DelF, f) end end
+function VS.ClearLast() for _, f in ipairs(ListDir(DIR_LAST)) do pcall(DelF, f) end end
+function VS.ClearSearchCache() WriteF(CACHE_SEARCH, "{}"); State.Cache.Searches = {} end
+function VS.ClearLibraryIndex() WriteF(LIB_INDEX, "{}"); State.Cache.Library = {} end
+function VS.ClearAll()
+	VS.ClearPlaying(); VS.ClearLast(); VS.ClearSearchCache(); VS.ClearLibraryIndex()
+	WriteF(HISTORY_FILE, "[]")
+end
+
+-- wiring
 function VS.WireSearchUi(args)
-	local SearchBox       = args.SearchBox
-	local SearchButton    = args.SearchButton
-	local ResultsContainer= args.ResultsContainer
-	local RowTemplate     = args.RowTemplate
-	local Map             = args.Map
+	local SearchBox        = args.SearchBox
+	local SearchButton     = args.SearchButton
+	local ResultsContainer = args.ResultsContainer
+	local RowTemplate      = args.RowTemplate
+	local Map              = args.Map
+	local Placeholder      = args.Placeholder
+	local LiveDelay        = tonumber(args.LiveDelay) or 0
+	local BusyIndicator    = args.BusyIndicator
+
 	if RowTemplate then VS.SetRowTemplate(RowTemplate) end
 	if ResultsContainer then VS.SetResultsContainer(ResultsContainer) end
 	if Map then VS.SetRowMap(Map) end
+	if Placeholder then VS.BindPlaceholder(Placeholder) end
+	if BusyIndicator then VS.BindBusyIndicator(BusyIndicator) end
+	State.UI.LiveDelay = LiveDelay
+
+	-- start with placeholder if nothing rendered
+	TogglePlaceholder(true)
+
 	if SearchButton then
 		SearchButton.Activated:Connect(function()
-			VS.SearchTo(ResultsContainer, SearchBox and SearchBox.Text or "", 1)
+			local q = (SearchBox and SearchBox.Text or "")
+			VS.SearchTo(ResultsContainer, q, 1)
 		end)
 	end
+
 	if SearchBox and SearchBox:IsA("TextBox") then
+		-- Enter to search
 		SearchBox.FocusLost:Connect(function(enter)
 			if enter then VS.SearchTo(ResultsContainer, SearchBox.Text, 1) end
 		end)
+
+		-- live search debounce
+		if State.UI.LiveDelay > 0 then
+			if State.UI._liveConn then State.UI._liveConn:Disconnect() end
+			local lastTick = 0
+			State.UI._liveConn = SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+				local txt = tostring(SearchBox.Text or "")
+				if txt:gsub("%s","") == "" then
+					VS.ClearResults(ResultsContainer)
+					return
+				end
+				lastTick = os.clock()
+				local myTick = lastTick
+				delay(State.UI.LiveDelay/1000, function()
+					if myTick == lastTick then
+						VS.SearchTo(ResultsContainer, txt, 1)
+					end
+				end)
+			end)
+		end
 	end
 end
 
---// ----------
+--==========
 return VS
