@@ -1,17 +1,56 @@
+--// =========================
+--// VibeStream Module (cached)
+--// =========================
+
+--// ---------- Constants
 local UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 local COOKIE = "zvApp=detect2; zvLang=0; zvAuth=1"
-local ROOT = "VibeStream"
-local DIR_PLAYING = ROOT.."/Playing"
-local DIR_LAST = ROOT.."/Last_Played"
-local HISTORY_FILE = ROOT.."/history.json"
-local MAX_HISTORY = 30
 
-local HttpService = game:GetService("HttpService")
-local SoundService = game:GetService("SoundService")
-local ContentProvider = game:GetService("ContentProvider")
+local ROOT          = "VibeStream"
+local DIR_LIBRARY   = ROOT.."/Library"       -- permanent store (no re-downloads)
+local DIR_PLAYING   = ROOT.."/Playing"       -- legacy (not used for storage now)
+local DIR_LAST      = ROOT.."/Last_Played"
+local HISTORY_FILE  = ROOT.."/history.json"
+local CACHE_SEARCH  = ROOT.."/search_cache.json"
+local LIB_INDEX     = ROOT.."/library.json"
+local MAX_HISTORY   = 30
 
+local IMAGE_PLAY    = "rbxassetid://135451326413860"
+local IMAGE_PAUSE   = "rbxassetid://90193543893908"
+
+--// ---------- Services
+local HttpService      = game:GetService("HttpService")
+local SoundService     = game:GetService("SoundService")
+local ContentProvider  = game:GetService("ContentProvider")
+local TweenService     = game:GetService("TweenService")
+
+--// ---------- Module table (public API)
 local VS = {}
 
+--// ---------- File helpers
+local function EnsureDir(p) if not isfolder(p) then makefolder(p) end end
+local function ReadF(p) if isfile(p) then return readfile(p) end end
+local function WriteF(p, s) writefile(p, s) end
+local function DelF(p) if isfile(p) then delfile(p) end end
+local function ListDir(p) if isfolder(p) then return listfiles(p) else return {} end end
+local function MoveFile(src, dst) local b=ReadF(src); if b then WriteF(dst,b); DelF(src) end end
+local function CopyFile(src, dst) local b=ReadF(src); if b then WriteF(dst,b) end end
+
+local function ReadJson(path, defaultTbl)
+	local ok, data = pcall(function()
+		local raw = ReadF(path)
+		return raw and HttpService:JSONDecode(raw) or nil
+	end)
+	if ok and typeof(data) == "table" then return data end
+	return defaultTbl or {}
+end
+
+local function WriteJson(path, tbl)
+	local ok, raw = pcall(function() return HttpService:JSONEncode(tbl) end)
+	if ok and raw then WriteF(path, raw) end
+end
+
+--// ---------- HTTP helpers
 local function Has(fname)
 	local ok, f = pcall(function() return getfenv()[fname] end)
 	return ok and typeof(f) == "function"
@@ -31,13 +70,7 @@ local function HttpGetUrl(url)
 	return nil
 end
 
-local function EnsureDir(p) if not isfolder(p) then makefolder(p) end end
-local function ReadF(p) if isfile(p) then return readfile(p) end end
-local function WriteF(p, s) writefile(p, s) end
-local function DelF(p) if isfile(p) then delfile(p) end end
-local function ListDir(p) if isfolder(p) then return listfiles(p) else return {} end end
-local function MoveFile(src, dst) local b=ReadF(src); if b then WriteF(dst,b); DelF(src) end end
-
+--// ---------- Misc helpers
 local function SanitizeFilename(s)
 	s = tostring(s or "audio")
 	s = s:gsub("[\\/:*?\"<>|]", "_")
@@ -78,83 +111,158 @@ local function LooksLikeMp3(bytes)
 	return false
 end
 
-EnsureDir(ROOT); EnsureDir(DIR_PLAYING); EnsureDir(DIR_LAST)
-if not isfile(HISTORY_FILE) then WriteF(HISTORY_FILE, "[]") end
-
-local state = {
-	sound = nil,
-	playing = false,
-	current = nil,
-	lastResults = {},
-	onEnded = nil,
-	historyLimit = MAX_HISTORY,
-	ui = { container = nil, rowTemplate = nil, rowFactory = nil, query = nil, nextPage = nil }
-}
-
-state.ui.map = {}
-
-local function GetFromPath(root, path)
-    if not root or not path or #path == 0 then return nil end
-    local cur = root
-    for seg in string.gmatch(path, "[^%.]+") do
-        local name, idx = seg:match("^([^%[]+)%[(%d+)%]$")
-        if name then
-            local n = 0
-            for _, ch in ipairs(cur:GetChildren()) do
-                if ch.Name == name then
-                    n = n + 1
-                    if n == tonumber(idx) then cur = ch break end
-                end
-            end
-        else
-            cur = cur:FindFirstChild(seg)
-        end
-        if not cur then return nil end
-    end
-    return cur
+local function FormatTime(secs)
+	secs = tonumber(secs) or 0
+	local m = math.floor(secs/60)
+	local s = secs%60
+	return string.format("%d:%02d", m, s)
 end
 
+--// ---------- Bootstrap storage
+EnsureDir(ROOT); EnsureDir(DIR_LIBRARY); EnsureDir(DIR_PLAYING); EnsureDir(DIR_LAST)
+if not isfile(HISTORY_FILE) then WriteF(HISTORY_FILE, "[]") end
+if not isfile(CACHE_SEARCH) then WriteF(CACHE_SEARCH, "{}") end
+if not isfile(LIB_INDEX) then WriteF(LIB_INDEX, "{}") end
+
+--// ---------- State (private)
+local State = {
+	Sound         = nil,
+	Playing       = false,
+	Current       = nil, -- { id, title, url, file }
+	LastResults   = {},
+	OnEnded       = nil,
+	HistoryLimit  = MAX_HISTORY,
+
+	UI = {
+		Container    = nil,
+		RowTemplate  = nil,
+		RowFactory   = nil,
+		Query        = nil,
+		NextPage     = nil,
+		Map          = {},           -- { PlayButton="A.B", TitleLabel="...", TimeLabel="..." }
+		ButtonById   = {},           -- id -> ImageButton
+		RowById      = {},           -- id -> row holder
+	},
+
+	Cache = {
+		Searches     = ReadJson(CACHE_SEARCH, {}),
+		Library      = ReadJson(LIB_INDEX, {}), -- id -> {file, title, url}
+	}
+}
+
+--// ---------- UI path helper
+local function GetFromPath(root, path)
+	if not root or not path or #path == 0 then return nil end
+	local cur = root
+	for seg in string.gmatch(path, "[^%.]+") do
+		local name, idx = seg:match("^([^%[]+)%[(%d+)%]$")
+		if name then
+			local n = 0
+			for _, ch in ipairs(cur:GetChildren()) do
+				if ch.Name == name then
+					n += 1
+					if n == tonumber(idx) then cur = ch break end
+				end
+			end
+		else
+			cur = cur:FindFirstChild(seg)
+		end
+		if not cur then return nil end
+	end
+	return cur
+end
+
+--// ---------- Audio
 local function EnsureSound()
-	if state.sound and state.sound.Parent then return state.sound end
+	if State.Sound and State.Sound.Parent then return State.Sound end
 	local s = Instance.new("Sound")
 	s.Name = "VibeStreamSound"
 	s.Parent = SoundService
 	s.Volume = 0.5
 	s.Looped = false
 	s.Ended:Connect(function()
-		state.playing = false
-		local c = state.current
+		State.Playing = false
+		local c = State.Current
+
+		-- copy last to DIR_LAST without touching library
 		if c and c.file and isfile(c.file) then
 			local lastPath = ("%s/%s.mp3"):format(DIR_LAST, tostring(c.id or "last"))
-			MoveFile(c.file, lastPath)
+			CopyFile(c.file, lastPath)
 		end
-		if state.onEnded then
+
+		-- reset buttons
+		VS.RefreshPlayButtons()
+
+		if State.OnEnded then
 			local id = c and c.id
-			task.spawn(state.onEnded, id)
+			task.spawn(State.OnEnded, id)
 		end
 	end)
-	state.sound = s
+	State.Sound = s
 	return s
 end
 
+local function ToAsset(path, id)
+	if Has("getsynasset") then
+		local ok, cid = pcall(getsynasset, path)
+		if ok and type(cid)=="string" and #cid>0 then return cid end
+	end
+	if Has("getcustomasset") then
+		local ok, cid = pcall(getcustomasset, path)
+		if ok and type(cid)=="string" and #cid>0 then return cid end
+	end
+	-- try relative fallbacks
+	if Has("getsynasset") then
+		local ok, cid = pcall(getsynasset, "./"..path); if ok and cid and #cid>0 then return cid end
+	end
+	if Has("getcustomasset") then
+		local ok, cid = pcall(getcustomasset, "./"..path); if ok and cid and #cid>0 then return cid end
+	end
+	return nil
+end
+
+local function PlayLocal(path, meta)
+	assert(type(path)=="string" and #path>0, "Invalid local path")
+	assert(isfile(path), "Audio file not found at "..tostring(path))
+
+	local s = EnsureSound()
+	s:Stop()
+
+	local cid = ToAsset(path, meta.id)
+	if not cid or #cid == 0 then
+		error("getcustomasset/getsynasset failed to map path -> ContentId ("..tostring(path)..")")
+	end
+
+	s.SoundId = cid
+	pcall(function() ContentProvider:PreloadAsync({s}) end)
+	s.PlaybackSpeed = 1
+	s.TimePosition = 0
+	s:Play()
+
+	State.Playing = true
+	State.Current = { id = meta.id, title = meta.title, url = meta.url, file = path }
+
+	-- update button visuals
+	VS.RefreshPlayButtons()
+end
+
+--// ---------- History & library
 local function PushHistory(entry)
-	local ok, tbl = pcall(function() return HttpService:JSONDecode(ReadF(HISTORY_FILE) or "[]") end)
-	local hist = (ok and typeof(tbl)=="table") and tbl or {}
+	local hist = ReadJson(HISTORY_FILE, {})
 	hist[#hist+1] = entry
-	local keep = state.historyLimit
-	if #hist > keep then
-		local drop = #hist - keep
-		for i = 1, drop do
-			local ev = hist[i]
-			if ev and ev.file and isfile(ev.file) then pcall(DelF, ev.file) end
-		end
+
+	-- trim
+	if #hist > State.HistoryLimit then
+		local drop = #hist - State.HistoryLimit
 		local new = {}
 		for i = drop+1, #hist do new[#new+1] = hist[i] end
 		hist = new
 	end
-	WriteF(HISTORY_FILE, HttpService:JSONEncode(hist))
+
+	WriteJson(HISTORY_FILE, hist)
 end
 
+--// ---------- Search
 local function ParseResults(html)
 	local out = {}
 	for node in html:gmatch("<span[^>]-class=\"song%-play[^\"\n]*\"[^>]->") do
@@ -168,39 +276,6 @@ local function ParseResults(html)
 	end
 	local nextPage = html:match("href=\"/mp3/search%?keywords[^\"=]*=[^\"]-page=(%d+)\"[^>]-class=\"next")
 	return out, (nextPage and tonumber(nextPage) or nil)
-end
-
-local function SearchImpl(query, page)
-	page = page or 1
-	local url = ("https://z3.fm/mp3/search?keywords=%s&page=%d&sort=views"):format(UrlEncode(query), page)
-	local r = Req({
-		Url = url, Method = "GET",
-		Headers = {
-			["User-Agent"] = UA,
-			["Cookie"] = COOKIE,
-			["X-Requested-With"] = "XMLHttpRequest",
-			["X-PJAX"] = "true",
-			["Accept"] = "*/*",
-			["Accept-Language"] = "en-US,en;q=0.9",
-			["Referer"] = "https://z3.fm/", ["DNT"] = "1",
-		}
-	})
-	local body = (r and r.Body) or ""
-	if #body < 400 then
-		local r2 = Req({
-			Url = url, Method = "GET",
-			Headers = {
-				["User-Agent"] = UA, ["Cookie"] = COOKIE,
-				["Accept"] = "text/html,application/xhtml+xml",
-				["Accept-Language"] = "en-US,en;q=0.9",
-				["Referer"] = "https://z3.fm/", ["DNT"] = "1",
-			}
-		})
-		body = (r2 and r2.Body) or body
-	end
-	local results, nextPage = ParseResults(body)
-	state.lastResults = results
-	return results, nextPage
 end
 
 local function ExtractMp3FromHtml(html)
@@ -270,13 +345,69 @@ local function ResolveMp3UrlOrBody(id)
 	return nil, "Could not resolve direct MP3 URL (no redirect or audio body)."
 end
 
-local function DownloadToPlaying(id, title)
-	EnsureDir(DIR_PLAYING)
-	for _, f in ipairs(ListDir(DIR_PLAYING)) do pcall(DelF, f) end
+-- Search with cache
+local function SearchImpl(query, page)
+	page = tonumber(page) or 1
+	local key = (string.lower(query or "") .. "::" .. tostring(page))
+
+	-- serve from cache
+	local cached = State.Cache.Searches[key]
+	if cached and type(cached) == "table" and cached.results then
+		State.LastResults = cached.results
+		return cached.results, cached.nextPage
+	end
+
+	-- fetch
+	local url = ("https://z3.fm/mp3/search?keywords=%s&page=%d&sort=views"):format(UrlEncode(query), page)
+	local r = Req({
+		Url = url, Method = "GET",
+		Headers = {
+			["User-Agent"] = UA, ["Cookie"] = COOKIE,
+			["X-Requested-With"] = "XMLHttpRequest",
+			["X-PJAX"] = "true", ["Accept"] = "*/*",
+			["Accept-Language"] = "en-US,en;q=0.9", ["Referer"] = "https://z3.fm/", ["DNT"] = "1",
+		}
+	})
+	local body = (r and r.Body) or ""
+
+	if #body < 400 then
+		local r2 = Req({
+			Url = url, Method = "GET",
+			Headers = {
+				["User-Agent"] = UA, ["Cookie"] = COOKIE,
+				["Accept"] = "text/html,application/xhtml+xml",
+				["Accept-Language"] = "en-US,en;q=0.9", ["Referer"] = "https://z3.fm/", ["DNT"] = "1",
+			}
+		})
+		body = (r2 and r2.Body) or body
+	end
+
+	local results, nextPage = ParseResults(body)
+
+	-- cache & persist
+	State.Cache.Searches[key] = { results = results, nextPage = nextPage }
+	WriteJson(CACHE_SEARCH, State.Cache.Searches)
+
+	State.LastResults = results
+	return results, nextPage
+end
+
+-- Download but prefer library
+local function DownloadOrGetFromLibrary(id, title)
+	id = tonumber(id)
+	local lib = State.Cache.Library
+	local entry = lib[tostring(id)]
+	if entry and entry.file and isfile(entry.file) then
+		return entry.file, entry.url or ""
+	end
+
+	-- resolve
 	local resolved, err = ResolveMp3UrlOrBody(id)
 	if not resolved then error(err or "MP3 resolve failed") end
+
 	local nice = SanitizeFilename(title or tostring(id))
-	local filePath = ("%s/%s_%s.mp3"):format(DIR_PLAYING, tostring(id), nice)
+	local filePath = ("%s/%s_%s.mp3"):format(DIR_LIBRARY, tostring(id), nice)
+
 	if resolved.directBody then
 		WriteF(filePath, resolved.directBody)
 	else
@@ -299,74 +430,28 @@ local function DownloadToPlaying(id, title)
 			WriteF(filePath, r.Body)
 		end
 	end
+
 	local bytes = ReadF(filePath)
 	if type(bytes) ~= "string" or #bytes == 0 then
 		error("Downloaded file is empty or missing: "..tostring(filePath))
 	end
+
+	-- save to library index (dedupe)
+	lib[tostring(id)] = { file = filePath, title = title or tostring(id), url = (resolved.url or resolved.finalUrl or "") }
+	WriteJson(LIB_INDEX, lib)
+
 	PushHistory({ id = id, title = title or tostring(id), url = resolved.url or (resolved.finalUrl or ""), file = filePath, t = os.time() })
+
 	return filePath, (resolved.url or resolved.finalUrl or "")
 end
 
-local function ToAsset(path, id)
-	if Has("getsynasset") then
-		local ok, cid = pcall(getsynasset, path)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
-		ok, cid = pcall(getsynasset, "./"..path)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
+--// ---------- UI render
+local function ClearContainer(container)
+	for _, c in ipairs(container:GetChildren()) do
+		if c:IsA("GuiObject") and c.Name == "SongRow" then c:Destroy() end
 	end
-	if Has("getcustomasset") then
-		local ok, cid = pcall(getcustomasset, path)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
-		ok, cid = pcall(getcustomasset, "./"..path)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
-	end
-	local rootName = ("VS_%s.mp3"):format(SanitizeFilename(tostring(id or "current")))
-	WriteF(rootName, ReadF(path) or "")
-	if Has("getsynasset") then
-		local ok, cid = pcall(getsynasset, rootName)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
-	end
-	if Has("getcustomasset") then
-		local ok, cid = pcall(getcustomasset, rootName)
-		if ok and type(cid)=="string" and #cid>0 then return cid end
-	end
-	local alts = { "/workspace/"..rootName, "workspace/"..rootName }
-	for _, p in ipairs(alts) do
-		if Has("getsynasset") then
-			local ok, cid = pcall(getsynasset, p)
-			if ok and type(cid)=="string" and #cid>0 then return cid end
-		end
-		if Has("getcustomasset") then
-			local ok, cid = pcall(getcustomasset, p)
-			if ok and type(cid)=="string" and #cid>0 then return cid end
-		end
-	end
-	return nil
-end
-
-local function PlayLocal(path, meta)
-	assert(type(path)=="string" and #path>0, "Invalid local path")
-	assert(isfile(path), "Audio file not found at "..tostring(path))
-	local s = EnsureSound()
-	s:Stop()
-	local cid = ToAsset(path, meta.id)
-	if not cid or #cid == 0 then
-		error("getcustomasset/getsynasset failed to map path -> ContentId ("..tostring(path)..")")
-	end
-	s.SoundId = cid
-	pcall(function() ContentProvider:PreloadAsync({s}) end)
-	s.PlaybackSpeed = 1
-	s.TimePosition = 0
-	s:Play()
-	state.playing = true
-	state.current = { id = meta.id, title = meta.title, url = meta.url, file = path }
-end
-
-local function FormatTime(secs)
-	secs = tonumber(secs) or 0
-	local m = math.floor(secs/60)
-	local s = secs%60
-	return string.format("%d:%02d", m, s)
+	State.UI.ButtonById = {}
+	State.UI.RowById = {}
 end
 
 local function DefaultRowFactory(parent)
@@ -375,105 +460,124 @@ local function DefaultRowFactory(parent)
 	b.TextXAlignment = Enum.TextXAlignment.Left
 	b.BackgroundTransparency = 0.1
 	b.Name = "SongRow"
-    b.Visible = true
 	b.Parent = parent
 	return b
 end
 
 local function MakeRow(parent)
-	if typeof(state.ui.rowFactory) == "function" then
-		local r = state.ui.rowFactory(parent)
+	if typeof(State.UI.RowFactory) == "function" then
+		local r = State.UI.RowFactory(parent)
 		if r then return r end
 	end
-	if state.ui.rowTemplate and state.ui.rowTemplate:IsA("Instance") then
-		local c = state.ui.rowTemplate:Clone()
+	if State.UI.RowTemplate and State.UI.RowTemplate:IsA("Instance") then
+		local c = State.UI.RowTemplate:Clone()
 		c.Name = "SongRow"
-        c.Visible = true
+		c.Visible = true
 		c.Parent = parent
 		return c
 	end
 	return DefaultRowFactory(parent)
 end
 
-local function ClearContainer(container)
-	for _, c in ipairs(container:GetChildren()) do
-		if c:IsA("GuiObject") and c.Name == "SongRow" then
-			c:Destroy()
+local function SetButtonHover(btn)
+	if not btn or not btn.MouseEnter then return end
+	btn.MouseEnter:Connect(function()
+		if btn:IsA("ImageButton") then
+			TweenService:Create(btn, TweenInfo.new(0.12), { ImageTransparency = 0.05 }):Play()
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if btn:IsA("ImageButton") then
+			TweenService:Create(btn, TweenInfo.new(0.12), { ImageTransparency = 0 }):Play()
+		end
+	end)
+end
+
+function VS.RefreshPlayButtons()
+	for id, btn in pairs(State.UI.ButtonById) do
+		if btn and btn:IsA("ImageButton") then
+			if State.Playing and State.Current and tonumber(id) == tonumber(State.Current.id) then
+				btn.Image = IMAGE_PAUSE
+			else
+				btn.Image = IMAGE_PLAY
+			end
 		end
 	end
 end
 
 local function RenderList(container, rows, replace)
-    if replace then
-        for _, c in ipairs(container:GetChildren()) do
-            if c:IsA("GuiObject") and c.Name == "SongRow" then c:Destroy() end
-        end
-    end
-    if not rows or #rows == 0 then
-        local holder = MakeRow(container)
-        local root = holder:FindFirstChild("Row") or holder
-        if state.ui.map and state.ui.map.TitleLabel then
-            local t = GetFromPath(root, state.ui.map.TitleLabel)
-            if t and t:IsA("TextLabel") then t.Text = "No results." end
-        elseif holder:IsA("TextButton") then
-            holder.Text = "No results."
-        end
-        return
-    end
-    for i, row in ipairs(rows) do
-        local holder = MakeRow(container)
-        local root = holder:FindFirstChild("Row") or holder
+	if replace then ClearContainer(container) end
 
-        if state.ui.map and state.ui.map.TitleLabel then
-            local tl = GetFromPath(root, state.ui.map.TitleLabel)
-            if tl and tl:IsA("TextLabel") then
-                tl.Text = tostring(row.title or ("ID "..tostring(row.id)))
-            end
-        elseif holder:IsA("TextButton") then
-            holder.Text = string.format("%d) %s  [%s]", i, row.title or ("ID "..tostring(row.id)), FormatTime(row.seconds or 0))
-        end
+	if not rows or #rows == 0 then
+		local holder = MakeRow(container)
+		local root = holder:FindFirstChild("Row") or holder
+		local t = State.UI.Map and GetFromPath(root, State.UI.Map.TitleLabel)
+		if t and t:IsA("TextLabel") then t.Text = "No results." end
+		if holder:IsA("TextButton") then holder.Text = "No results." end
+		return
+	end
 
-        if state.ui.map and state.ui.map.TimeLabel then
-            local tm = GetFromPath(root, state.ui.map.TimeLabel)
-            if tm and tm:IsA("TextLabel") then
-                tm.Text = FormatTime(row.seconds or 0)
-            end
-        end
+	for i, row in ipairs(rows) do
+		local holder = MakeRow(container)
+		local root = holder:FindFirstChild("Row") or holder
 
-        local function Play()
-            task.spawn(function()
-                local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
-                if not ok then warn(err) end
-            end)
-        end
+		-- labels
+		local tl = State.UI.Map and GetFromPath(root, State.UI.Map.TitleLabel)
+		if tl and tl:IsA("TextLabel") then tl.Text = tostring(row.title or ("ID "..tostring(row.id))) end
+		local tm = State.UI.Map and GetFromPath(root, State.UI.Map.TimeLabel)
+		if tm and tm:IsA("TextLabel") then tm.Text = FormatTime(row.seconds or 0) end
+		if holder:IsA("TextButton") and not tl then
+			holder.Text = string.format("%d) %s  [%s]", i, row.title or ("ID "..tostring(row.id)), FormatTime(row.seconds or 0))
+		end
 
-        local target = nil
-        if state.ui.map and state.ui.map.PlayButton then
-            target = GetFromPath(root, state.ui.map.PlayButton)
-        end
+		-- play button
+		local target = State.UI.Map and GetFromPath(root, State.UI.Map.PlayButton)
+		if target and target:IsA("ImageButton") then
+			target.Image = IMAGE_PLAY
+			SetButtonHover(target)
+			State.UI.ButtonById[tostring(row.id)] = target
+			State.UI.RowById[tostring(row.id)] = holder
 
-        if target and target:IsA("GuiButton") then
-            target.MouseButton1Click:Connect(Play)
-        elseif holder:IsA("GuiButton") then
-            holder.MouseButton1Click:Connect(Play)
-        else
-            holder.InputBegan:Connect(function(inp)
-                if inp.UserInputType == Enum.UserInputType.MouseButton1 then Play() end
-            end)
-        end
-    end
+			target.MouseButton1Click:Connect(function()
+				if State.Current and tonumber(State.Current.id) == tonumber(row.id) then
+					-- toggle pause/resume on the same track
+					if State.Playing then VS.Pause() else VS.Resume() end
+					VS.RefreshPlayButtons()
+					return
+				end
+				-- play another track
+				task.spawn(function()
+					local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
+					if not ok then warn(err) end
+				end)
+			end)
+		elseif holder:IsA("GuiButton") then
+			holder.MouseButton1Click:Connect(function()
+				task.spawn(function()
+					local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
+					if not ok then warn(err) end
+				end)
+			end)
+		end
+	end
+
+	-- ensure icons reflect current state after rendering
+	VS.RefreshPlayButtons()
 end
 
-function VS.SetRowMap(map)
-    state.ui.map = map or {} 
-end
+--// ---------- Public API
 
-function VS.Search(q, page)
-	return SearchImpl(q, page)
-end
+function VS.SetRowMap(map) State.UI.Map = map or {} end
+function VS.SetRowFactory(fn) State.UI.RowFactory = fn end
+function VS.SetRowTemplate(template) State.UI.RowTemplate = template end
+function VS.SetResultsContainer(container) State.UI.Container = container end
+function VS.SetHistoryLimit(n) State.HistoryLimit = math.max(1, tonumber(n) or MAX_HISTORY) end
+function VS.OnEnded(fn) State.OnEnded = fn end
+
+function VS.Search(q, page) return SearchImpl(q, page) end
 
 function VS.PlayById(id, title)
-	local filePath, url = DownloadToPlaying(id, title)
+	local filePath, url = DownloadOrGetFromLibrary(id, title)
 	PlayLocal(filePath, { id = id, title = title or tostring(id), url = url })
 end
 
@@ -486,102 +590,92 @@ function VS.SearchAndPlay(query, index, page)
 	return true
 end
 
-function VS.Pause() local s=EnsureSound(); s:Pause(); state.playing=false end
-function VS.Resume() local s=EnsureSound(); s:Resume(); state.playing=true end
-function VS.TogglePause() local s=EnsureSound(); if s.IsPlaying then s:Pause(); state.playing=false else s:Resume(); state.playing=true end end
-function VS.Stop() local s=EnsureSound(); s:Stop(); state.playing=false end
+function VS.Pause() local s=EnsureSound(); s:Pause(); State.Playing=false; VS.RefreshPlayButtons() end
+function VS.Resume() local s=EnsureSound(); s:Resume(); State.Playing=true; VS.RefreshPlayButtons() end
+function VS.TogglePause() if State.Playing then VS.Pause() else VS.Resume() end end
+function VS.Stop() local s=EnsureSound(); s:Stop(); State.Playing=false; VS.RefreshPlayButtons() end
 function VS.Seek(sec) local s=EnsureSound(); s.TimePosition = math.max(0, tonumber(sec) or 0) end
 function VS.SetSpeed(rate) local s=EnsureSound(); s.PlaybackSpeed = math.clamp(tonumber(rate) or 1, 0.05, 4) end
 function VS.SetVolume(v) local s=EnsureSound(); s.Volume = math.clamp(tonumber(v) or 0.5, 0, 1) end
 
-function VS.OnEnded(fn) state.onEnded = fn end
-function VS.SetHistoryLimit(n) state.historyLimit = math.max(1, tonumber(n) or MAX_HISTORY) end
-
 function VS.SwapToLastPlayed()
-	local ok, tbl = pcall(function() return HttpService:JSONDecode(ReadF(HISTORY_FILE) or "[]") end)
-	local hist = (ok and typeof(tbl)=="table") and tbl or {}
+	local hist = ReadJson(HISTORY_FILE, {})
 	if #hist == 0 then return false end
 	local last = hist[#hist-1] or hist[#hist]
 	if not last or not last.file or not isfile(last.file) then return false end
-	for _, f in ipairs(ListDir(DIR_PLAYING)) do pcall(DelF, f) end
-	local back = ("%s/%s.mp3"):format(DIR_PLAYING, tostring(last.id or "prev"))
-	MoveFile(last.file, back)
-	PlayLocal(back, { id = last.id, title = last.title, url = last.url })
+	PlayLocal(last.file, { id = last.id, title = last.title, url = last.url })
 	return true
 end
 
 function VS.GetState()
 	local s = EnsureSound()
-	local c = state.current or {}
+	local c = State.Current or {}
 	local playbackState = "Unknown"
 	pcall(function() playbackState = s.PlaybackState and s.PlaybackState.Name or (s.IsPlaying and "Playing" or "Stopped") end)
 	return {
 		id=c.id, title=c.title, url=c.url, file=c.file,
-		isPlaying=state.playing, time=s.TimePosition, length=s.TimeLength,
+		isPlaying=State.Playing, time=s.TimePosition, length=s.TimeLength,
 		volume=s.Volume, speed=s.PlaybackSpeed, playbackState=playbackState,
 	}
 end
 
-function VS.GetLastResults() return state.lastResults end
-function VS.GetHistory()
-	local ok, tbl = pcall(function() return HttpService:JSONDecode(ReadF(HISTORY_FILE) or "[]") end)
-	return (ok and typeof(tbl)=="table") and tbl or {}
-end
+function VS.GetLastResults() return State.LastResults end
+function VS.GetHistory() return ReadJson(HISTORY_FILE, {}) end
 
 function VS.ClearPlaying() for _, f in ipairs(ListDir(DIR_PLAYING)) do pcall(DelF, f) end end
 function VS.ClearLast() for _, f in ipairs(ListDir(DIR_LAST)) do pcall(DelF, f) end end
-function VS.ClearAll() VS.ClearPlaying(); VS.ClearLast(); WriteF(HISTORY_FILE, "[]") end
-
-function VS.SetRowFactory(fn) state.ui.rowFactory = fn end
-function VS.SetRowTemplate(template) state.ui.rowTemplate = template end
-function VS.SetResultsContainer(container) state.ui.container = container end
+function VS.ClearAll()
+	VS.ClearPlaying(); VS.ClearLast()
+	WriteF(HISTORY_FILE, "[]"); WriteF(CACHE_SEARCH, "{}"); WriteF(LIB_INDEX, "{}")
+	State.Cache.Searches = {}; State.Cache.Library = {}
+end
 
 function VS.RenderResultsTo(container, results)
-	state.ui.container = container or state.ui.container
-	if not state.ui.container then return end
-	RenderList(state.ui.container, results, true)
+	State.UI.Container = container or State.UI.Container
+	if not State.UI.Container then return end
+	RenderList(State.UI.Container, results, true)
 end
 
 function VS.AppendResultsTo(container, results)
-	local c = container or state.ui.container
+	local c = container or State.UI.Container
 	if not c then return end
 	RenderList(c, results, false)
 end
 
 function VS.ClearResults(container)
-	local c = container or state.ui.container
+	local c = container or State.UI.Container
 	if not c then return end
 	ClearContainer(c)
 end
 
 function VS.SearchTo(container, q, page)
-	state.ui.container = container or state.ui.container
-	if not state.ui.container then return end
+	State.UI.Container = container or State.UI.Container
+	if not State.UI.Container then return end
 	if not q or q == "" then return end
 	task.spawn(function()
 		local ok, res, np = pcall(function() return VS.Search(q, page) end)
 		if not ok then
-			RenderList(state.ui.container, {}, true)
+			RenderList(State.UI.Container, {}, true)
 			return
 		end
-		state.ui.query = q
-		state.ui.nextPage = np
-		RenderList(state.ui.container, res, true)
+		State.UI.Query = q
+		State.UI.NextPage = np
+		RenderList(State.UI.Container, res, true)
 	end)
 end
 
 function VS.NextPage(container)
-	state.ui.container = container or state.ui.container
-	if not state.ui.container then return end
-	if not state.ui.query then return end
-	if not state.ui.nextPage then return end
-	local q = state.ui.query
-	local p = tonumber(state.ui.nextPage)
+	State.UI.Container = container or State.UI.Container
+	if not State.UI.Container then return end
+	if not State.UI.Query then return end
+	if not State.UI.NextPage then return end
+	local q = State.UI.Query
+	local p = tonumber(State.UI.NextPage)
 	task.spawn(function()
 		local ok, res, np = pcall(function() return VS.Search(q, p) end)
 		if not ok then return end
-		state.ui.nextPage = np
-		RenderList(state.ui.container, res, false)
+		State.UI.NextPage = np
+		RenderList(State.UI.Container, res, false)
 	end)
 end
 
@@ -595,7 +689,7 @@ function VS.PlayFirstOfLast()
 end
 
 function VS.PlayAtIndex(i)
-	local rows = state.lastResults or {}
+	local rows = State.LastResults or {}
 	if not rows or #rows == 0 then return false end
 	local n = math.clamp(tonumber(i) or 1, 1, #rows)
 	local row = rows[n]
@@ -604,24 +698,25 @@ function VS.PlayAtIndex(i)
 end
 
 function VS.WireSearchUi(args)
-    local SearchBox = args.SearchBox
-    local SearchButton = args.SearchButton
-    local ResultsContainer = args.ResultsContainer
-    local RowTemplate = args.RowTemplate
-    local Map = args.Map
-    if RowTemplate then VS.SetRowTemplate(RowTemplate) end
-    if ResultsContainer then VS.SetResultsContainer(ResultsContainer) end
-    if Map then VS.SetRowMap(Map) end
-    if SearchButton then
-        SearchButton.Activated:Connect(function()
-            VS.SearchTo(ResultsContainer, SearchBox and SearchBox.Text or "", 1)
-        end)
-    end
-    if SearchBox and SearchBox:IsA("TextBox") then
-        SearchBox.FocusLost:Connect(function(enter)
-            if enter then VS.SearchTo(ResultsContainer, SearchBox.Text, 1) end
-        end)
-    end
+	local SearchBox       = args.SearchBox
+	local SearchButton    = args.SearchButton
+	local ResultsContainer= args.ResultsContainer
+	local RowTemplate     = args.RowTemplate
+	local Map             = args.Map
+	if RowTemplate then VS.SetRowTemplate(RowTemplate) end
+	if ResultsContainer then VS.SetResultsContainer(ResultsContainer) end
+	if Map then VS.SetRowMap(Map) end
+	if SearchButton then
+		SearchButton.Activated:Connect(function()
+			VS.SearchTo(ResultsContainer, SearchBox and SearchBox.Text or "", 1)
+		end)
+	end
+	if SearchBox and SearchBox:IsA("TextBox") then
+		SearchBox.FocusLost:Connect(function(enter)
+			if enter then VS.SearchTo(ResultsContainer, SearchBox.Text, 1) end
+		end)
+	end
 end
 
+--// ----------
 return VS
