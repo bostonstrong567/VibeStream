@@ -89,6 +89,29 @@ local state = {
 	ui = { container = nil, rowTemplate = nil, rowFactory = nil, query = nil, nextPage = nil }
 }
 
+state.ui.map = {}
+
+local function GetFromPath(root, path)
+    if not root or not path or #path == 0 then return nil end
+    local cur = root
+    for seg in string.gmatch(path, "[^%.]+") do
+        local name, idx = seg:match("^([^%[]+)%[(%d+)%]$")
+        if name then
+            local n = 0
+            for _, ch in ipairs(cur:GetChildren()) do
+                if ch.Name == name then
+                    n = n + 1
+                    if n == tonumber(idx) then cur = ch break end
+                end
+            end
+        else
+            cur = cur:FindFirstChild(seg)
+        end
+        if not cur then return nil end
+    end
+    return cur
+end
+
 local function EnsureSound()
 	if state.sound and state.sound.Parent then return state.sound end
 	local s = Instance.new("Sound")
@@ -377,29 +400,71 @@ local function ClearContainer(container)
 end
 
 local function RenderList(container, rows, replace)
-	if replace then ClearContainer(container) end
-	if not rows or #rows == 0 then
-		local e = MakeRow(container)
-		e.Text = "No results."
-		e.Active = false
-		e.AutoButtonColor = false
-		return
-	end
-	for i, row in ipairs(rows) do
-		local b = MakeRow(container)
-		b.Text = string.format("%d) %s  [%s]", i, row.title or ("ID "..tostring(row.id)), FormatTime(row.seconds or 0))
-		b.MouseButton1Click:Connect(function()
-			task.spawn(function()
-				local ok, err = pcall(function()
-					VS.PlayById(row.id, row.title)
-				end)
-				if not ok then warn("Play error: "..tostring(err)) end
-			end)
-		end)
-	end
+    if replace then
+        for _, c in ipairs(container:GetChildren()) do
+            if c:IsA("GuiObject") and c.Name == "SongRow" then c:Destroy() end
+        end
+    end
+    if not rows or #rows == 0 then
+        local holder = MakeRow(container)
+        local root = holder:FindFirstChild("Row") or holder
+        if state.ui.map and state.ui.map.TitleLabel then
+            local t = GetFromPath(root, state.ui.map.TitleLabel)
+            if t and t:IsA("TextLabel") then t.Text = "No results." end
+        elseif holder:IsA("TextButton") then
+            holder.Text = "No results."
+        end
+        return
+    end
+    for i, row in ipairs(rows) do
+        local holder = MakeRow(container)
+        local root = holder:FindFirstChild("Row") or holder
+
+        if state.ui.map and state.ui.map.TitleLabel then
+            local tl = GetFromPath(root, state.ui.map.TitleLabel)
+            if tl and tl:IsA("TextLabel") then
+                tl.Text = tostring(row.title or ("ID "..tostring(row.id)))
+            end
+        elseif holder:IsA("TextButton") then
+            holder.Text = string.format("%d) %s  [%s]", i, row.title or ("ID "..tostring(row.id)), FormatTime(row.seconds or 0))
+        end
+
+        if state.ui.map and state.ui.map.TimeLabel then
+            local tm = GetFromPath(root, state.ui.map.TimeLabel)
+            if tm and tm:IsA("TextLabel") then
+                tm.Text = FormatTime(row.seconds or 0)
+            end
+        end
+
+        local function Play()
+            task.spawn(function()
+                local ok, err = pcall(function() VS.PlayById(row.id, row.title) end)
+                if not ok then warn(err) end
+            end)
+        end
+
+        local target = nil
+        if state.ui.map and state.ui.map.PlayButton then
+            target = GetFromPath(root, state.ui.map.PlayButton)
+        end
+
+        if target and target:IsA("GuiButton") then
+            target.MouseButton1Click:Connect(Play)
+        elseif holder:IsA("GuiButton") then
+            holder.MouseButton1Click:Connect(Play)
+        else
+            holder.InputBegan:Connect(function(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseButton1 then Play() end
+            end)
+        end
+    end
 end
 
 local VS = {}
+
+function VS.SetRowMap(map)
+    state.ui.map = map or {} 
+end
 
 function VS.Search(q, page)
 	return SearchImpl(q, page)
@@ -537,22 +602,24 @@ function VS.PlayAtIndex(i)
 end
 
 function VS.WireSearchUi(args)
-	local SearchBox = args.SearchBox
-	local SearchButton = args.SearchButton
-	local ResultsContainer = args.ResultsContainer
-	local RowTemplate = args.RowTemplate
-	if RowTemplate then VS.SetRowTemplate(RowTemplate) end
-	if ResultsContainer then VS.SetResultsContainer(ResultsContainer) end
-	if SearchButton then
-		SearchButton.Activated:Connect(function()
-			VS.SearchTo(ResultsContainer, SearchBox and SearchBox.Text or "", 1)
-		end)
-	end
-	if SearchBox and SearchBox:IsA("TextBox") then
-		SearchBox.FocusLost:Connect(function(enter)
-			if enter then VS.SearchTo(ResultsContainer, SearchBox.Text, 1) end
-		end)
-	end
+    local SearchBox = args.SearchBox
+    local SearchButton = args.SearchButton
+    local ResultsContainer = args.ResultsContainer
+    local RowTemplate = args.RowTemplate
+    local Map = args.Map
+    if RowTemplate then VS.SetRowTemplate(RowTemplate) end
+    if ResultsContainer then VS.SetResultsContainer(ResultsContainer) end
+    if Map then VS.SetRowMap(Map) end
+    if SearchButton then
+        SearchButton.Activated:Connect(function()
+            VS.SearchTo(ResultsContainer, SearchBox and SearchBox.Text or "", 1)
+        end)
+    end
+    if SearchBox and SearchBox:IsA("TextBox") then
+        SearchBox.FocusLost:Connect(function(enter)
+            if enter then VS.SearchTo(ResultsContainer, SearchBox.Text, 1) end
+        end)
+    end
 end
 
 return VS
