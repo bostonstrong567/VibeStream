@@ -386,6 +386,7 @@ local function MakeRow(parent)
 	if state.ui.rowTemplate and state.ui.rowTemplate:IsA("Instance") then
 		local c = state.ui.rowTemplate:Clone()
 		c.Name = "SongRow"
+        c.Visible = true
 		c.Parent = parent
 		return c
 	end
