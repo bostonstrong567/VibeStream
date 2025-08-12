@@ -10,6 +10,8 @@ local HttpService = game:GetService("HttpService")
 local SoundService = game:GetService("SoundService")
 local ContentProvider = game:GetService("ContentProvider")
 
+local VS = {}
+
 local function Has(fname)
 	local ok, f = pcall(function() return getfenv()[fname] end)
 	return ok and typeof(f) == "function"
@@ -461,8 +463,6 @@ local function RenderList(container, rows, replace)
         end
     end
 end
-
-local VS = {}
 
 function VS.SetRowMap(map)
     state.ui.map = map or {} 
