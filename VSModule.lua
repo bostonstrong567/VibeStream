@@ -373,6 +373,7 @@ local function DefaultRowFactory(parent)
 	b.TextXAlignment = Enum.TextXAlignment.Left
 	b.BackgroundTransparency = 0.1
 	b.Name = "SongRow"
+    b.Visible = true
 	b.Parent = parent
 	return b
 end
